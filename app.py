@@ -136,8 +136,19 @@ except Exception as e:
     )
     st.stop()
 
+# lap data is required for everything below
+try:
+    _ = session.laps
+except Exception as e:
+    st.error(f"Lap data isn't available for this session yet: {e}")
+    st.stop()
+
 # ---------- drivers ----------
-res = session.results
+try:
+    res = session.results
+except Exception:
+    res = None
+
 if res is not None and len(res) > 0:
     if top4_only:
         mask = res["TeamName"].str.contains("|".join(TOP4), case=False, na=False)
@@ -160,7 +171,10 @@ def dlabel(d):
 
 
 # ---------- weather ----------
-wd = session.weather_data
+try:
+    wd = session.weather_data
+except Exception:
+    wd = None
 if wd is not None and len(wd) > 0:
     st.sidebar.header("Weather (session avg)")
     st.sidebar.write(f"Air: {wd['AirTemp'].mean():.1f} °C")
@@ -169,6 +183,8 @@ if wd is not None and len(wd) > 0:
     st.sidebar.write(f"Pressure: {wd['Pressure'].mean():.1f} hPa")
     st.sidebar.write(f"Wind: {wd['WindSpeed'].mean():.1f} m/s")
     st.sidebar.write("Rain: " + ("YES" if wd["Rain"].any() else "DRY"))
+else:
+    st.sidebar.caption("Weather data not available for this session.")
 
 st.markdown(f"*{session.event['EventName']} {year} - {sess_name}*")
 tab_pace, tab_tel, tab_tyre, tab_res = st.tabs(
@@ -315,5 +331,4 @@ with tab_res:
         st.info("No results available.")
     else:
         cols = [c for c in ["Position", "Abbreviation", "FullName", "TeamName",
-                            "GridPosition", "Status", "Points"] if c in res_view.columns]
-        st.dataframe(res_view[cols], hide_index=True, use_container_width=True)
+                            "GridPosition", "Status", "
