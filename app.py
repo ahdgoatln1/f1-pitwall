@@ -330,5 +330,7 @@ with tab_res:
     if res is None or len(res) == 0:
         st.info("No results available.")
     else:
-        cols = [c for c in ["Position", "Abbreviation", "FullName", "TeamName",
-                            "GridPosition", "Status", "
+        wanted = ["Position", "Abbreviation", "FullName", "TeamName"]
+        wanted += ["GridPosition", "Status", "Points"]
+        cols = [c for c in wanted if c in res_view.columns]
+        st.dataframe(res_view[cols], hide_index=True, use_container_width=True)
