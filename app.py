@@ -11,7 +11,9 @@ from plotly.subplots import make_subplots
 st.set_page_config(page_title="F1 Pitwall", layout="wide")
 st.markdown(
     "<style>.stApp{background:#0b0d10;} "
-    "html,body,[class*='css']{font-family:'Courier New',monospace;}</style>",
+    "html,body,[class*='css']{font-family:'Courier New',monospace;} "
+    "h3{letter-spacing:0.2em;color:#ff8700;} "
+    ".stTabs [data-baseweb='tab']{font-size:0.95rem;}</style>",
     unsafe_allow_html=True,
 )
 
@@ -111,6 +113,7 @@ def load_all(skey):
         frame("stints", session_key=skey),
         frame("weather", session_key=skey),
         frame("session_result", session_key=skey),
+        frame("pit", session_key=skey),
     )
 
 
@@ -178,12 +181,13 @@ sess_choice = st.sidebar.selectbox(
     format_func=lambda x: x[0],
 )
 session_key = int(sess_choice[1])
+is_race = sess_choice[0] in ("Race", "Sprint")
 top4_only = st.sidebar.checkbox("Top 4 teams only (McLaren, Ferrari, Red Bull, Mercedes)")
 
 # ---------- load session data ----------
 try:
     with st.spinner("Loading session data..."):
-        drivers_df, laps_df, stints_df, weather_df, res_df = load_all(session_key)
+        drivers_df, laps_df, stints_df, weather_df, res_df, pit_df = load_all(session_key)
 except Exception as e:
     st.error(f"Could not load this session: {e}")
     st.stop()
@@ -197,16 +201,22 @@ drivers_df = ensure(drivers_df.copy(), ["driver_number", "name_acronym", "full_n
 drivers_df = num(drivers_df, ["driver_number"]).drop_duplicates("driver_number")
 laps_df = ensure(laps_df.copy(), ["driver_number", "lap_number", "lap_duration",
                                   "duration_sector_1", "duration_sector_2",
-                                  "duration_sector_3", "is_pit_out_lap", "date_start"])
+                                  "duration_sector_3", "is_pit_out_lap", "date_start",
+                                  "i1_speed", "i2_speed", "st_speed"])
 laps_df = num(laps_df, ["driver_number", "lap_number", "lap_duration",
-                        "duration_sector_1", "duration_sector_2", "duration_sector_3"])
-laps_df = laps_df.dropna(subset=["lap_number"])
+                        "duration_sector_1", "duration_sector_2", "duration_sector_3",
+                        "i1_speed", "i2_speed", "st_speed"])
+laps_df = laps_df.dropna(subset=["lap_number", "driver_number"])
 stints_df = ensure(stints_df.copy(), ["driver_number", "stint_number", "lap_start",
                                       "lap_end", "compound", "tyre_age_at_start"])
 stints_df = num(stints_df, ["driver_number", "lap_start", "lap_end", "tyre_age_at_start"])
 res_df = ensure(res_df.copy(), ["position", "driver_number", "number_of_laps",
                                 "gap_to_leader", "dnf", "dns", "dsq"])
 res_df = num(res_df, ["position", "driver_number"])
+pit_df = ensure(pit_df.copy(), ["driver_number", "lap_number", "pit_duration",
+                                "stop_duration", "lane_duration"])
+pit_df = num(pit_df, ["driver_number", "lap_number", "pit_duration",
+                      "stop_duration", "lane_duration"])
 
 acr_of = dict(zip(drivers_df["driver_number"], drivers_df["name_acronym"]))
 team_of = dict(zip(drivers_df["driver_number"], drivers_df["team_name"]))
@@ -235,6 +245,10 @@ def dlabel(n):
     return f"{acr_of.get(n, n)} - {team_of.get(n, '')}"
 
 
+def dacr(n):
+    return acr_of.get(int(n), str(n))
+
+
 def dcolour(n):
     c = col_of.get(n)
     return f"#{c}" if isinstance(c, str) and len(c) == 6 else "#bbbbbb"
@@ -255,9 +269,41 @@ if not weather_df.empty:
 else:
     st.sidebar.caption("Weather data not available for this session.")
 
+# ---------- lap crossing times (used by pit window, race trace, positions) ----------
+laps_u = laps_df.drop_duplicates(["driver_number", "lap_number"]).copy()
+laps_u["driver_number"] = laps_u["driver_number"].astype(int)
+laps_u["lap_number"] = laps_u["lap_number"].astype(int)
+max_lap = int(laps_u["lap_number"].max())
+
+
+def build_times():
+    lu = laps_u.copy()
+    lu["t_start"] = to_dt(lu["date_start"])
+    st_piv = lu.pivot(index="lap_number", columns="driver_number", values="t_start")
+    du_piv = lu.pivot(index="lap_number", columns="driver_number", values="lap_duration")
+    full = range(1, max_lap + 1)
+    st_piv = st_piv.reindex(full)
+    du_piv = du_piv.reindex(full)
+    end = st_piv.shift(-1)
+    fallback = st_piv + du_piv.apply(lambda c: pd.to_timedelta(c, unit="s"))
+    end = end.fillna(fallback)
+    t0 = end.min().min()
+    if pd.isna(t0):
+        return None
+    return end.sub(t0).apply(lambda c: c.dt.total_seconds())
+
+
+secs, secs_err = None, ""
+try:
+    secs = build_times()
+except Exception as e:
+    secs_err = str(e)
+
 st.markdown(f"*{mk_choice[1]} {year} - {sess_choice[0]}*")
-tab_pace, tab_tel, tab_tyre, tab_res = st.tabs(
-    ["Pace monitor", "Telemetry + delta", "Tyre strategy", "Results"]
+(tab_pace, tab_tel, tab_pit, tab_trace,
+ tab_sec, tab_tyre, tab_res) = st.tabs(
+    ["Pace monitor", "Telemetry + delta", "Pit window", "Race trace",
+     "Sectors + speed", "Tyre strategy", "Results"]
 )
 
 
@@ -453,6 +499,252 @@ def telemetry_view():
 
 with tab_tel:
     telemetry_view()
+
+
+# ---------- pit window ("circle of doom") ----------
+def estimate_green_loss():
+    """Median time lost per stop, from this session's own stops."""
+    if pit_df.empty:
+        return None
+    losses = []
+    for _, p in pit_df.iterrows():
+        n, L = p["driver_number"], p["lap_number"]
+        if pd.isna(n) or pd.isna(L):
+            continue
+        d = (laps_u[laps_u["driver_number"] == int(n)]
+             .set_index("lap_number")["lap_duration"])
+        L = int(L)
+        ref = [d.get(L + k) for k in (-4, -3, 3, 4, 5)]
+        ref = [x for x in ref if x is not None and pd.notna(x)]
+        if len(ref) < 3:
+            continue
+        pairs = []
+        for a_, b_ in ((L - 1, L), (L, L + 1)):
+            x, y = d.get(a_), d.get(b_)
+            if x is not None and y is not None and pd.notna(x) and pd.notna(y):
+                pairs.append(x + y)
+        if not pairs:
+            continue
+        loss = max(pairs) - 2 * float(np.median(ref))
+        if 12 < loss < 40:
+            losses.append(loss)
+    if len(losses) < 3:
+        return None
+    return float(np.clip(np.median(losses), 15, 35))
+
+
+@st.fragment
+def pit_view():
+    if not is_race:
+        st.info("The pit window is for Race and Sprint sessions.")
+        return
+    if secs is None or secs.empty:
+        st.info(f"Lap timing is not complete enough for this view. {secs_err}")
+        return
+    est = estimate_green_loss()
+    base = round(est, 1) if est else 22.0
+    st.caption(
+        ("Green-flag pit loss estimated from this session's own stops. "
+         if est else "Not enough stop data, so the green-flag loss is a default. ")
+        + "VSC and SC losses are assumptions (65% and 56% of green). Edit all three."
+    )
+    c1, c2, c3 = st.columns(3)
+    g = c1.number_input("Green loss (s)", 5.0, 60.0, float(base), 0.1, key=f"gl_{session_key}")
+    v = c2.number_input("VSC loss (s)", 3.0, 60.0, round(base * 0.65, 1), 0.1, key=f"vl_{session_key}")
+    s = c3.number_input("SC loss (s)", 3.0, 60.0, round(base * 0.56, 1), 0.1, key=f"sl_{session_key}")
+
+    drv = st.selectbox("Driver pitting", driver_nums, format_func=dlabel, key="pw_d")
+    lap = st.slider("Pit at the end of lap", 1, max_lap, min(15, max_lap),
+                    key=f"pw_l_{session_key}")
+
+    T = secs.loc[lap].dropna()
+    if drv not in T.index:
+        st.info("This driver has no timing at that lap (retired or not started).")
+        return
+    others = T.drop(drv)
+    now_pos = int((T < T[drv]).sum()) + 1
+
+    scen = [("Green flag", g, "#39b54a", "GRN"),
+            ("VSC", v, "#ffd12e", "VSC"),
+            ("Safety car", s, "#ff8700", "SC")]
+    rows = []
+    for name, loss, _, _ in scen:
+        target = T[drv] + loss
+        ahead = others[others < target]
+        behind = others[others >= target]
+        a_txt = (f"{dacr(ahead.idxmax())} ({target - ahead.max():.1f}s)"
+                 if len(ahead) else "none (leader)")
+        b_txt = (f"{dacr(behind.idxmin())} ({behind.min() - target:.1f}s)"
+                 if len(behind) else "none (last)")
+        rows.append({"Scenario": name, "Loss (s)": round(loss, 1),
+                     "Rejoins": f"P{len(ahead) + 1}",
+                     "Car ahead (gap)": a_txt, "Car behind (gap)": b_txt})
+    st.markdown(f"*{dacr(drv)} is P{now_pos} at the end of lap {lap}.* If he pits then:")
+    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+    W = max(40, int(round(g + 15)))
+    rel = others - T[drv]
+    inwin = rel[rel.abs() <= W]
+    fig = go.Figure()
+    fig.add_trace(go.Scatterpolar(
+        r=[1] * len(inwin), theta=(inwin / (2 * W) * 360).tolist(),
+        mode="markers+text",
+        text=[dacr(n) for n in inwin.index], textposition="top center",
+        marker=dict(size=14, color=[dcolour(int(n)) for n in inwin.index],
+                    line=dict(color="#ffffff", width=1)),
+        customdata=inwin.round(1).tolist(),
+        hovertemplate="%{text}: %{customdata:+.1f}s<extra></extra>",
+        showlegend=False,
+    ))
+    fig.add_trace(go.Scatterpolar(
+        r=[1], theta=[0], mode="markers+text", text=[dacr(drv)],
+        textposition="top center",
+        marker=dict(size=20, symbol="star", color="#ffffff"), showlegend=False,
+    ))
+    for name, loss, colour, short in scen:
+        fig.add_trace(go.Scatterpolar(
+            r=[0.7], theta=[min(loss, W) / (2 * W) * 360], mode="markers+text",
+            text=[short], textposition="bottom center", name=f"{short} rejoin",
+            marker=dict(size=16, symbol="diamond", color=colour),
+        ))
+    step = 10
+    tvals = list(range(-(W // step) * step, (W // step) * step + 1, step))
+    fig.update_layout(
+        template="plotly_dark", paper_bgcolor=BG, height=560,
+        polar=dict(
+            bgcolor=BG,
+            radialaxis=dict(visible=False, range=[0, 1.35]),
+            angularaxis=dict(direction="clockwise", rotation=90,
+                             tickmode="array",
+                             tickvals=[t / (2 * W) * 360 for t in tvals],
+                             ticktext=[f"{t:+d}s" for t in tvals],
+                             gridcolor="#333333"),
+        ),
+        legend=dict(orientation="h", y=-0.05),
+        margin=dict(l=30, r=30, t=30, b=30),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption(
+        "Star = the pitting driver. Clockwise = cars behind him, anticlockwise = cars "
+        "ahead (gap in seconds on the rim). Diamonds = where his pit stop drops him in "
+        "the gap order. Static model: other cars keep running, no traffic, and a real "
+        "SC bunches the field up."
+    )
+
+
+with tab_pit:
+    pit_view()
+
+
+# ---------- race trace + positions ----------
+@st.fragment
+def trace_view():
+    if not is_race:
+        st.info("Race trace and positions are for Race and Sprint sessions.")
+        return
+    if secs is None or secs.empty:
+        st.info(f"Lap timing is not complete enough for this view. {secs_err}")
+        return
+    sel = st.multiselect("Drivers", driver_nums, default=driver_nums[:6],
+                         format_func=dacr, key="trace_sel")
+    cap = st.slider("Max gap shown (s)", 20, 300, 90, key="trace_cap")
+    if not sel:
+        st.info("Pick at least one driver.")
+        return
+
+    gap = secs.sub(secs.min(axis=1), axis=0)
+    gap = gap.where(gap <= cap)
+    rank = secs.rank(axis=1, method="min")
+
+    used = set()
+    fig1, fig2 = go.Figure(), go.Figure()
+    for n in sel:
+        if n not in secs.columns:
+            continue
+        col = dcolour(n)
+        dash = "dot" if col in used else "solid"
+        used.add(col)
+        for fig, ser in ((fig1, gap[n]), (fig2, rank[n])):
+            fig.add_trace(go.Scatter(x=ser.index, y=ser.values, name=dacr(n),
+                                     mode="lines", line=dict(color=col, width=2, dash=dash),
+                                     connectgaps=False))
+    fig1.update_yaxes(autorange="reversed", title_text="Gap to leader (s)")
+    fig2.update_yaxes(autorange="reversed", title_text="Position", dtick=1)
+    for fig, title in ((fig1, "Race trace - gap to leader"), (fig2, "Position by lap")):
+        fig.update_xaxes(title_text="Lap")
+        fig.update_layout(template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG,
+                          title=title, height=420, hovermode="x unified",
+                          margin=dict(l=10, r=10, t=40, b=10))
+    st.plotly_chart(fig1, use_container_width=True)
+    st.plotly_chart(fig2, use_container_width=True)
+    st.caption("Built from each driver's line-crossing times, so a position can differ "
+               "slightly from the official order when lapped cars are involved.")
+
+
+with tab_trace:
+    trace_view()
+
+
+# ---------- sectors + speed + pit stops ----------
+@st.fragment
+def sectors_view():
+    g = laps_df[laps_df["driver_number"].isin(driver_nums)]
+    best = g.groupby("driver_number").agg(
+        S1=("duration_sector_1", "min"), S2=("duration_sector_2", "min"),
+        S3=("duration_sector_3", "min"), Best=("lap_duration", "min"))
+    best["Ideal"] = best["S1"] + best["S2"] + best["S3"]
+    best = best.sort_values("Ideal")
+    best.insert(0, "Team", [team_of.get(n, "") for n in best.index])
+    best.insert(0, "Driver", [dacr(n) for n in best.index])
+    best = best.reset_index(drop=True)
+    nums = ["S1", "S2", "S3", "Best", "Ideal"]
+
+    def hl(col):
+        m = col.min()
+        return ["background-color:#7b2cbf;color:white" if v == m else "" for v in col]
+
+    st.subheader("Best sectors (purple = fastest in the session)")
+    st.dataframe(best.style.apply(hl, subset=nums).format("{:.3f}", subset=nums, na_rep="—"),
+                 hide_index=True, use_container_width=True)
+    st.caption("Ideal = best S1 + best S2 + best S3 for that driver.")
+
+    sp = g.groupby("driver_number").agg(
+        I1=("i1_speed", "max"), I2=("i2_speed", "max"), Trap=("st_speed", "max"))
+    sp = sp.dropna(subset=["Trap"]).sort_values("Trap", ascending=False)
+    st.subheader("Speed trap (km/h)")
+    if len(sp) == 0:
+        st.caption("No speed trap data for this session.")
+    else:
+        fig = go.Figure(go.Bar(
+            x=[dacr(n) for n in sp.index], y=sp["Trap"],
+            marker=dict(color=[dcolour(int(n)) for n in sp.index]),
+            hovertemplate="%{x}: %{y:.0f} km/h<extra></extra>"))
+        fig.update_yaxes(range=[float(sp["Trap"].min()) - 10, float(sp["Trap"].max()) + 5],
+                         title_text="Top speed at trap (km/h)")
+        fig.update_layout(template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG,
+                          height=360, margin=dict(l=10, r=10, t=10, b=10))
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("Pit stops")
+    pv = pit_df[pit_df["driver_number"].isin(driver_nums)].copy()
+    dur_cols = [(c, lbl) for c, lbl in (("stop_duration", "Stationary (s)"),
+                                        ("lane_duration", "Pit lane (s)"),
+                                        ("pit_duration", "Pit duration (s)"))
+                if pv[c].notna().any()]
+    if len(pv) == 0 or not dur_cols:
+        st.caption("No pit stop data for this session.")
+        return
+    out = pd.DataFrame({"Driver": pv["driver_number"].map(dacr),
+                        "Lap": pv["lap_number"].map(lambda x: "—" if pd.isna(x) else int(x))})
+    for c, lbl in dur_cols:
+        out[lbl] = pv[c].round(2)
+    key = dur_cols[0][1]
+    out = out.sort_values(key)
+    st.dataframe(out, hide_index=True, use_container_width=True)
+
+
+with tab_sec:
+    sectors_view()
 
 
 # ---------- tyres ----------
